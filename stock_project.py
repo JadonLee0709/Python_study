@@ -1,3 +1,5 @@
+#update 0906
+
 import time
 from typing import List
 import requests
@@ -15,7 +17,7 @@ HEADERS = {
     )
 }
 
-#asdad
+
 def Daily_prices_naver(code: str, pages: int = 10) -> pd.DataFrame:
     """
     네이버 금융 일별시세에서 종가 기준 데이터 수집
