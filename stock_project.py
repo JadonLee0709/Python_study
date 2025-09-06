@@ -1,4 +1,4 @@
-#update 0906
+#update 0906(ver.2)
 
 import time
 from typing import List
