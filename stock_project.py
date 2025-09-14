@@ -1,9 +1,10 @@
-#update 0906(ver.2 )
+#update 0914(ver.3)
 
 import time
 from typing import List
 import requests
 import pandas as pd
+import matplotlib.pyplot as plt
 
 
 # ❗ BASE_URL은 code/page 자리표시자가 있어야 .format이 동작함
@@ -89,9 +90,28 @@ def stock_calculator(code: str, pages: int = 20) -> pd.DataFrame:
     prices = _add_moving_averages(prices, windows=(20, 50))
     return prices
 
+
+def graph_operator(df):
+    plt.figure(figsize=(12, 6))
+    plt.title("20일선과 50일선의 일간 변화")
+    plt.xlabel("날짜")
+    plt.ylabel("금액")
+    plt.grid(True)
+
+    # 종가(Close), 20일선, 50일선 그래프
+    plt.plot(df["Date"], df["Close"], label="Close", color="blue")
+    plt.plot(df["Date"], df["MA20"], label="20일선", color="red", linestyle="--")
+    plt.plot(df["Date"], df["MA50"], label="50일선", color="green", linestyle="-.")
+
+    plt.legend()
+    plt.show()
+
 if __name__ == "__main__":
     code = input("종목 코드를 입력하세요 (예: 삼성전자 005930): ")
     pages = int(input("몇 페이지를 가져올까요? (예: 20): "))
 
     df = stock_calculator(code=code, pages=pages)
     print(df.tail())
+
+    #그래프 실행
+    graph_operator(df)
