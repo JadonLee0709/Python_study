@@ -1,9 +1,9 @@
 # stock_project.py
-# update 0915 (auto code grab from Naver search page + manual fallback + multiprocessing)
+# update_251002_dynamic_MA
 
 import time
 import re
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from urllib.parse import quote
 import webbrowser
 import requests
@@ -78,15 +78,27 @@ FALLBACK_MAP = {
 }
 
 # -----------------------------
+# 유틸: MA 윈도우 파싱 (예: "20,60" -> (20, 60))
+# -----------------------------
+def parse_windows(s: str, default: Tuple[int, ...] = (20, 50)) -> Tuple[int, ...]:
+    try:
+        wins = tuple(int(x) for x in s.replace(" ", "").split(",") if x)
+        if not wins or any(w <= 0 for w in wins):
+            return default
+        return wins
+    except Exception:
+        return default
+
+# -----------------------------
 # 네이버 검색에서 종목코드 추출
 # -----------------------------
 def get_code_from_naver_search(query: str) -> Optional[str]:
-    url = f"https://search.naver.com/search.naver?query={quote(query)}"
+    url = "https://search.naver.com/search.naver?query={}".format(quote(query))
     try:
         r = requests.get(url, headers=SEARCH_HEADERS, timeout=12)
         r.raise_for_status()
     except Exception as e:
-        print(f"[WARN] naver search request fail: {e}")
+        print("[WARN] naver search request fail: {}".format(e))
         return None
 
     html = r.text
@@ -180,43 +192,75 @@ def Daily_prices_naver(code: str, pages: int = 10, workers: int = None) -> pd.Da
     return out
 
 # -----------------------------
-# 이동평균선 계산
+# 이동평균선 계산 (동적 창 길이)
 # -----------------------------
-def _add_moving_averages(df: pd.DataFrame, windows=(20, 50)) -> pd.DataFrame:
+def _add_moving_averages(df: pd.DataFrame, windows: Tuple[int, ...] = (20, 50)) -> pd.DataFrame:
     out = df.copy()
     for w in windows:
-        out[f"MA{w}"] = out["Close"].rolling(window=w, min_periods=w).mean()
+        col = "MA{}".format(w)
+        out[col] = out["Close"].rolling(window=w, min_periods=w).mean()
     return out
 
-def stock_calculator(code: str, pages: int = 20, workers: int = None) -> pd.DataFrame:
+def stock_calculator(code: str, pages: int = 20, workers: int = None,
+                     ma_windows: Tuple[int, ...] = (20, 50)) -> pd.DataFrame:
     prices = Daily_prices_naver(code=code, pages=pages, workers=workers)
-    prices = _add_moving_averages(prices, windows=(20, 50))
+    prices = _add_moving_averages(prices, windows=ma_windows)
     return prices
 
 # -----------------------------
-# 그래프
+# 그래프 (동적 창 길이)
 # -----------------------------
-def graph_operator(df: pd.DataFrame):
+def graph_operator(df: pd.DataFrame, windows: Tuple[int, ...] = (20, 50)):
     plt.figure(figsize=(12, 6))
-    plt.title("20일선 & 50일선 추세")
+
+    if len(windows) == 2:
+        title = "{}일선 & {}일선 추세".format(windows[0], windows[1])
+    else:
+        title = "이동평균선({})".format(", ".join(str(w) for w in windows))
+    plt.title(title)
+
     plt.xlabel("날짜")
     plt.ylabel("주가")
     plt.grid(True)
+
     plt.plot(df["Date"], df["Close"], label="종가", color="blue")
-    plt.plot(df["Date"], df["MA20"], label="20일선", color="red", linestyle="--")
-    plt.plot(df["Date"], df["MA50"], label="50일선", color="green", linestyle="-.")
+
+    for w in windows:
+        col = "MA{}".format(w)
+        if col in df.columns:
+            plt.plot(df["Date"], df[col], label="{}일선".format(w), linestyle="--")
+
     plt.legend()
     plt.tight_layout()
     plt.show()
 
 # -----------------------------
-# 알람 기능
+# 알람 기능 (동적: 가장 짧은 MA vs 가장 긴 MA 교차)
 # -----------------------------
-def alarm_operator(df: pd.DataFrame) -> str:
-    if df["MA20"].iloc[-1] > df["MA50"].iloc[-1] and df["MA20"].iloc[-2] <= df["MA50"].iloc[-2]:
-        return "📈 골든크로스 발생! (매수 신호 가능)"
-    elif df["MA20"].iloc[-1] < df["MA50"].iloc[-1] and df["MA20"].iloc[-2] >= df["MA50"].iloc[-2]:
-        return "📉 데드크로스 발생! (매도 신호 가능)"
+def alarm_operator(df: pd.DataFrame, windows: Tuple[int, ...] = (20, 50)) -> str:
+    if not windows:
+        return "⚖️ 창 길이 미지정"
+
+    short = min(windows)
+    long_ = max(windows)
+    cs = "MA{}".format(short)
+    cl = "MA{}".format(long_)
+
+    if cs not in df.columns or cl not in df.columns:
+        return "⚖️ 필요한 이동평균 컬럼이 없습니다."
+
+    # 두 MA가 유효한(NA 아님) 최근 2개 구간 확보
+    tmp = df.dropna(subset=[cs, cl])
+    if len(tmp) < 2:
+        return "⚖️ 데이터가 부족합니다."
+
+    last = tmp.iloc[-1]
+    prev = tmp.iloc[-2]
+
+    if (last[cs] > last[cl]) and (prev[cs] <= prev[cl]):
+        return "📈 골든크로스({}↗{}).".format(short, long_)
+    elif (last[cs] < last[cl]) and (prev[cs] >= prev[cl]):
+        return "📉 데드크로스({}↘{}).".format(short, long_)
     else:
         return "⚖️ 특별한 신호 없음"
 
@@ -251,22 +295,30 @@ def run_app():
         code = pick_code_from_text(pasted)
 
     if not code:
-        messagebox.showerror("입력 오류", f"유효한 코드가 없습니다. (입력: {text})")
+        messagebox.showerror("입력 오류", "유효한 코드가 없습니다. (입력: {})".format(text))
         return
 
     pages = simpledialog.askinteger("페이지 수", "몇 페이지 가져올까요?", minvalue=1, maxvalue=100)
     if not pages:
         return
 
-    workers = simpledialog.askinteger("코어 수", "사용할 코어 개수 (기본: 최대치)", minvalue=1, maxvalue=multiprocessing.cpu_count())
+    raw_win = simpledialog.askstring("이동평균", "창 길이(쉼표, 예: 20,60) [기본 20,50]:") or ""
+    ma_windows = parse_windows(raw_win, default=(20, 50))
 
-    df = stock_calculator(code, pages, workers=workers)
+    workers = simpledialog.askinteger(
+        "코어 수",
+        "사용할 코어 개수 (기본: 최대치)",
+        minvalue=1,
+        maxvalue=multiprocessing.cpu_count()
+    )
+
+    df = stock_calculator(code, pages, workers=workers, ma_windows=ma_windows)
     if df.empty:
-        messagebox.showerror("데이터 없음", f"code={code} 데이터 없음")
+        messagebox.showerror("데이터 없음", "code={} 데이터 없음".format(code))
         return
 
-    graph_operator(df)
-    signal = alarm_operator(df)
+    graph_operator(df, windows=ma_windows)
+    signal = alarm_operator(df, windows=ma_windows)
     messagebox.showinfo("알림", signal)
 
 def start_gui():
@@ -289,16 +341,19 @@ if __name__ == "__main__":
             print("❌ 코드 확인 불가")
         else:
             pages = int(input("몇 페이지를 가져올까요? (예: 20): ").strip() or "20")
-            workers = input(f"몇 개 코어를 사용할까요? (최대={multiprocessing.cpu_count()}): ").strip()
+            raw_win = input("이동평균 창 길이(쉼표, 예: 20,60) [기본 20,50]: ").strip()
+            ma_windows = parse_windows(raw_win, default=(20, 50))
+
+            workers = input("몇 개 코어를 사용할까요? (최대={}): ".format(multiprocessing.cpu_count())).strip()
             workers = int(workers) if workers else None
 
-            df = stock_calculator(code, pages, workers=workers)
+            df = stock_calculator(code, pages, workers=workers, ma_windows=ma_windows)
             if df.empty:
-                print(f"❌ 데이터 없음 (code={code})")
+                print("❌ 데이터 없음 (code={})".format(code))
             else:
                 print(df.tail())
-                signal = alarm_operator(df)
+                signal = alarm_operator(df, windows=ma_windows)
                 print(signal)
-                graph_operator(df)
+                graph_operator(df, windows=ma_windows)
     else:
         start_gui()
