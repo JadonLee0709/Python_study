@@ -1,5 +1,5 @@
 # stock_project.py
-# update_251110_fixed_MAs + math_analysis_derivatives
+# update_251110_fixed_MAs + math_analysis_derivatives + trend/peaks/backtest
 
 import time
 import re
@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 from bs4 import BeautifulSoup
 import concurrent.futures
 import multiprocessing
+import numpy as np
 
 # GUI
 import tkinter as tk
@@ -266,7 +267,7 @@ def _add_derivative_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     out = df.copy()
 
-    # 가격 자체의 변화율(1차, 2차)
+    # 가격 자체의 변화량(1차, 2차)
     out["d1_Close"] = out["Close"].diff()       # 1차 미분 근사
     out["d2_Close"] = out["d1_Close"].diff()    # 2차 미분 근사
 
@@ -375,6 +376,206 @@ def math_analysis_report(df: pd.DataFrame, horizon: int = 5) -> str:
 
 
 # -----------------------------
+# 추세 레이블링 (상승장/하락장/전환 구간)
+# -----------------------------
+def add_trend_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    MA60, MA120과 그 기울기를 이용해서
+    각 날짜별로 'bull', 'bear', 'transition' 레이블을 붙인다.
+    """
+    work = _add_moving_averages(df.copy())
+    work = _add_derivative_features(work)
+
+    labels = []
+    for _, row in work.iterrows():
+        d1_ma60 = row.get("d1_MA60", 0)
+        d1_ma120 = row.get("d1_MA120", 0)
+        ma60 = row.get("MA60", np.nan)
+        ma120 = row.get("MA120", np.nan)
+
+        label = "transition"
+        if pd.notna(ma60) and pd.notna(ma120):
+            # 장기 상승장: 둘 다 우상향 + MA60 > MA120
+            if (d1_ma60 > 0) and (d1_ma120 > 0) and (ma60 > ma120):
+                label = "bull"
+            # 장기 하락장: 둘 다 우하향 + MA60 < MA120
+            elif (d1_ma60 < 0) and (d1_ma120 < 0) and (ma60 < ma120):
+                label = "bear"
+        labels.append(label)
+
+    work["trend_label"] = labels
+    return work
+
+
+# -----------------------------
+# 극대/극소(국소 고점/저점) 탐지
+# -----------------------------
+def detect_local_extrema(df: pd.DataFrame, window: int = 1) -> pd.DataFrame:
+    """
+    단순한 방법으로 국소 극대/극소를 찾는다.
+    window=1이면 i-1, i, i+1 세 점 비교해서
+    - i가 양쪽보다 크면 is_peak=True
+    - i가 양쪽보다 작으면 is_trough=True
+    """
+    work = df.copy().reset_index(drop=True)
+    n = len(work)
+    is_peak = [False] * n
+    is_trough = [False] * n
+
+    for i in range(window, n - window):
+        center = work.at[i, "Close"]
+        left = work.at[i - window, "Close"]
+        right = work.at[i + window, "Close"]
+
+        if center > left and center >= right:
+            is_peak[i] = True
+        if center < left and center <= right:
+            is_trough[i] = True
+
+    work["is_peak"] = is_peak
+    work["is_trough"] = is_trough
+    return work
+
+
+# -----------------------------
+# 단순 MA20·MA60 추세+조정 전략 백테스트
+# -----------------------------
+def _max_drawdown(equity: pd.Series) -> float:
+    """
+    최대 낙폭(MDD) 계산: (최고점 대비 최저점 하락률)
+    """
+    cum_max = equity.cummax()
+    dd = (equity - cum_max) / cum_max
+    return float(dd.min())  # 음수 값
+
+
+def backtest_ma20_60_strategy(
+    df: pd.DataFrame,
+    fee_rate: float = 0.0005,   # 왕복 수수료·세금 대충 0.05% 가정
+    initial_cash: float = 10_000_000.0
+) -> dict:
+    """
+    MA20·MA60 + 20일선 기울기 기반 단순 전략 백테스트.
+    - 진입: Close > MA20, MA20 > MA60, d1_MA20 > 0
+    - 청산: Close < MA20 or MA20 < MA60
+    - 항상 전액 매수 / 전액 현금
+    """
+    # 이동평균/미분 컬럼이 없으면 추가
+    work = df.copy()
+    if "MA20" not in work.columns or "MA60" not in work.columns:
+        work = _add_moving_averages(work)
+    work = _add_derivative_features(work)
+
+    # 필수 컬럼 체크
+    for col in ["Close", "MA20", "MA60", "d1_MA20"]:
+        if col not in work.columns:
+            raise ValueError(f"필수 컬럼이 없습니다: {col}")
+
+    work = work.dropna(subset=["Close", "MA20", "MA60", "d1_MA20"]).reset_index(drop=True)
+
+    cash = initial_cash
+    shares = 0.0
+    equity_list: List[float] = []
+    position_flag: List[int] = []
+    trades: List[dict] = []
+
+    in_position = False
+    entry_price = None
+    entry_idx = None
+
+    for i, row in work.iterrows():
+        price = float(row["Close"])
+        ma20 = float(row["MA20"])
+        ma60 = float(row["MA60"])
+        d1_ma20 = float(row["d1_MA20"])
+
+        # 보유 중 → 청산 조건 체크
+        if in_position:
+            if (price < ma20) or (ma20 < ma60):
+                # 전량 매도
+                sell_price = price * (1 - fee_rate)
+                cash = shares * sell_price
+                trades.append({
+                    "entry_idx": entry_idx,
+                    "exit_idx": i,
+                    "entry_price": entry_price,
+                    "exit_price": sell_price,
+                    "ret": sell_price / entry_price - 1.0,
+                })
+                shares = 0.0
+                in_position = False
+                entry_price = None
+                entry_idx = None
+        else:
+            # 미보유 → 진입 조건 체크
+            if (price > ma20) and (ma20 > ma60) and (d1_ma20 > 0):
+                buy_price = price * (1 + fee_rate)
+                shares = cash / buy_price
+                cash = 0.0
+                in_position = True
+                entry_price = buy_price
+                entry_idx = i
+
+        # 하루 종료 후 평가액 기록
+        equity = cash + shares * price
+        equity_list.append(equity)
+        position_flag.append(1 if in_position else 0)
+
+    work["equity"] = equity_list
+    work["position"] = position_flag
+
+    # 일별 수익률
+    work["equity_ret"] = work["equity"].pct_change().fillna(0.0)
+
+    total_return = work["equity"].iloc[-1] / initial_cash - 1.0
+    mdd = _max_drawdown(work["equity"])
+    # 연율화 샤프 (252거래일 가정)
+    mean_ret = work["equity_ret"].mean()
+    std_ret = work["equity_ret"].std()
+    if std_ret > 0:
+        sharpe = (mean_ret / std_ret) * np.sqrt(252)
+    else:
+        sharpe = 0.0
+
+    # 트레이드 통계
+    n_trades = len(trades)
+    if n_trades > 0:
+        rets = np.array([t["ret"] for t in trades])
+        win_rate = float((rets > 0).mean())
+        avg_trade_ret = float(rets.mean())
+    else:
+        win_rate = 0.0
+        avg_trade_ret = 0.0
+
+    result = {
+        "total_return": total_return,
+        "MDD": mdd,
+        "sharpe": sharpe,
+        "n_trades": n_trades,
+        "win_rate": win_rate,
+        "avg_trade_ret": avg_trade_ret,
+        "equity_curve": work[["Date", "equity", "position"]].copy(),
+        "trades": trades,
+    }
+    return result
+
+
+def print_backtest_report(result: dict, name: str = "MA20·60 전략"):
+    """
+    backtest_ma20_60_strategy 결과 dict를 예쁘게 출력
+    """
+    print(f"\n=== 백테스트 결과: {name} ===")
+    print(f"총 수익률: {result['total_return'] * 100:.2f}%")
+    print(f"최대 낙폭(MDD): {result['MDD'] * 100:.2f}%")
+    print(f"샤프 비율(단순): {result['sharpe']:.2f}")
+    print(f"트레이드 수: {result['n_trades']}회")
+    if result["n_trades"] > 0:
+        print(f"승률: {result['win_rate'] * 100:.1f}%")
+        print(f"평균 트레이드 수익률: {result['avg_trade_ret'] * 100:.2f}%")
+    print("====================================")
+
+
+# -----------------------------
 # 코드 해석
 # -----------------------------
 def resolve_to_code(user_input: str) -> Optional[str]:
@@ -472,6 +673,17 @@ if __name__ == "__main__":
                 report = math_analysis_report(df, horizon=5)
                 print("\n=== 수학적 분석(미분 기반) ===")
                 print(report)
+
+                # 추세 레이블 확인
+                trend_df = add_trend_labels(df)
+                print("\n최근 추세 레이블:", trend_df["trend_label"].iloc[-1])
+
+                # MA20·60 전략 백테스트
+                try:
+                    bt_result = backtest_ma20_60_strategy(df)
+                    print_backtest_report(bt_result, name=f"{code} MA20·60 전략")
+                except Exception as e:
+                    print("[WARN] 백테스트 중 오류:", e)
 
                 graph_operator(df)
     else:
